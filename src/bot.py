@@ -16,11 +16,13 @@ Run:
 
 import os
 import re
+import json
 import time
 import random
 import asyncio
 import logging
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 import discord
@@ -51,6 +53,10 @@ MAX_VIDEO_MB = 100  # Skip videos larger than this to avoid burning bandwidth/qu
 # file exists, yt-dlp uses the logged-in session, which allows downloading
 # age/audience-restricted reels. See README for how to export it.
 IG_COOKIE_FILE = os.environ.get("IG_COOKIE_FILE", "/app/cookies/cookies.txt")
+
+# Persistent record of already-analyzed reels, so the same reel is never sent
+# to Gemini twice; instead the bot points at whoever shared it first.
+SEEN_REELS_FILE = os.environ.get("SEEN_REELS_FILE", "/app/data/seen_reels.json")
 GEMINI_MODEL = "gemini-flash-latest"  # Always points at the latest stable Flash; switch to gemini-pro-latest for higher accuracy
 
 # Free-tier RPM is very low: only let one video hit Gemini at a time and make
@@ -70,6 +76,48 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+
+
+# The shortcode uniquely identifies a reel; tracking params like ?igsh=... vary
+# per sender, so dedupe on the shortcode rather than the full URL
+SHORTCODE_PATTERN = re.compile(
+    r"instagram\.com/(?:reel|reels|p)/([A-Za-z0-9_\-]+)", re.IGNORECASE
+)
+
+
+def reel_key(url: str) -> str:
+    match = SHORTCODE_PATTERN.search(url)
+    return match.group(1) if match else url
+
+
+def _load_seen_reels() -> dict:
+    try:
+        with open(SEEN_REELS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        logger.error(f"Failed to load {SEEN_REELS_FILE}, starting empty: {e}")
+        return {}
+
+
+def _save_seen_reels():
+    try:
+        os.makedirs(os.path.dirname(SEEN_REELS_FILE), exist_ok=True)
+        tmp_path = SEEN_REELS_FILE + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(seen_reels, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, SEEN_REELS_FILE)
+    except Exception as e:
+        logger.error(f"Failed to save {SEEN_REELS_FILE}: {e}")
+
+
+seen_reels: dict = _load_seen_reels()
+
+# Reels currently being analyzed, so the same reel posted twice in quick
+# succession doesn't get processed twice (all mutation happens on the event
+# loop, so no lock is needed)
+in_progress_reels: set[str] = set()
 
 
 class QuotaExceededError(Exception):
@@ -203,7 +251,54 @@ async def on_message(message: discord.Message):
     await bot.process_commands(message)
 
 
+def _duplicate_embed(record: dict) -> discord.Embed:
+    posted_at = ""
+    try:
+        ts = int(datetime.fromisoformat(record["timestamp"]).timestamp())
+        posted_at = f" <t:{ts}:R>"
+    except Exception:
+        pass
+    embed = discord.Embed(
+        title="🔁 This reel was already shared",
+        description=(
+            f"First shared by <@{record['author_id']}>{posted_at} — "
+            f"[jump to the original message]({record['jump_url']})"
+        ),
+        color=discord.Color.orange(),
+    )
+    summary = record.get("summary")
+    if summary:
+        # Embed field values cap at 1024 characters
+        if len(summary) > 1000:
+            summary = summary[:1000] + "\n...(truncated)"
+        embed.add_field(name="Earlier summary", value=summary, inline=False)
+    return embed
+
+
 async def handle_reel(message: discord.Message, url: str):
+    key = reel_key(url)
+
+    record = seen_reels.get(key)
+    if record:
+        logger.info(f"Skipping already-analyzed reel {key} (first shared by {record.get('author_name')})")
+        await message.reply(embed=_duplicate_embed(record), mention_author=False)
+        return
+
+    if key in in_progress_reels:
+        await message.reply(
+            f"⏳ This reel was just posted and is already being analyzed — the summary will appear above.\n{url}",
+            mention_author=False,
+        )
+        return
+
+    in_progress_reels.add(key)
+    try:
+        await _analyze_reel(message, url, key)
+    finally:
+        in_progress_reels.discard(key)
+
+
+async def _analyze_reel(message: discord.Message, url: str, key: str):
     status_msg = await message.reply(f"🔎 Reels link detected, downloading...\n{url}")
 
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -242,6 +337,17 @@ async def handle_reel(message: discord.Message, url: str):
                 logger.exception("Gemini summarization failed")
                 await status_msg.edit(content=f"❌ AI summary failed: {e}\n{url}")
                 return
+
+        # Record the successful analysis so this reel is never re-analyzed
+        seen_reels[key] = {
+            "url": url,
+            "author_id": message.author.id,
+            "author_name": message.author.display_name,
+            "jump_url": message.jump_url,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "summary": summary,
+        }
+        _save_seen_reels()
 
         # Discord messages cap at 2000 characters; truncate if needed
         if len(summary) > 1900:

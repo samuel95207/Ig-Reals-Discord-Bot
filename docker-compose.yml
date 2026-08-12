@@ -9,6 +9,8 @@ services:
       - GEMINI_API_KEY=${GEMINI_API_KEY}
     volumes:
       - ig_cookies:/app/cookies
+      - ig_data:/app/data
 
 volumes:
   ig_cookies:
+  ig_data:
