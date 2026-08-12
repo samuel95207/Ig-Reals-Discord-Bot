@@ -91,6 +91,10 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # switch restarts the whole upload → analyze pipeline on the new client
 gemini_clients = [genai.Client(api_key=key) for key in GEMINI_API_KEYS]
 
+# Keys found to be denied/invalid (e.g. 403 PERMISSION_DENIED) are dropped
+# from rotation until the bot restarts
+disabled_gemini_keys: set[int] = set()
+
 
 # The shortcode uniquely identifies a reel; tracking params like ?igsh=... vary
 # per sender, so dedupe on the shortcode rather than the full URL
@@ -172,6 +176,19 @@ class QuotaExhaustedError(Exception):
         self.retry_delay = _parse_retry_delay_seconds(original)
 
 
+class KeyUnusableError(Exception):
+    """The key or its project is denied/invalid; drop it from rotation."""
+
+
+def _is_key_unusable_error(e: Exception) -> bool:
+    """403 PERMISSION_DENIED / invalid API key: permanent for this key, unlike quota."""
+    status_code = getattr(e, "code", None) or getattr(e, "status_code", None)
+    if status_code == 403:
+        return True
+    msg = str(e)
+    return any(kw in msg for kw in ("PERMISSION_DENIED", "API_KEY_INVALID", "API key not valid"))
+
+
 async def _call_with_retry(func, *args):
     """
     Run a blocking Gemini call in a thread, retrying automatically.
@@ -186,6 +203,8 @@ async def _call_with_retry(func, *args):
         except Exception as e:
             if _is_quota_error(e):
                 raise QuotaExhaustedError(e) from e
+            if _is_key_unusable_error(e):
+                raise KeyUnusableError(str(e)) from e
             if _is_transient_error(e) and transient_attempts < MAX_RETRIES:
                 transient_attempts += 1
                 wait = BASE_BACKOFF_SECONDS * (2 ** (transient_attempts - 1)) + random.uniform(0, 2)
@@ -277,18 +296,29 @@ async def summarize_video_with_gemini(video_path: Path, status_msg, url: str) ->
     """
     round_num = 0
     while True:
+        usable = [i for i in range(len(gemini_clients)) if i not in disabled_gemini_keys]
+        if not usable:
+            raise RuntimeError(
+                "All Gemini API keys are denied or invalid — check them in Google AI Studio"
+            )
+
         retry_delays = []
-        for idx, client in enumerate(gemini_clients):
+        for idx in usable:
             try:
-                return await _summarize_with_client(client, video_path)
+                return await _summarize_with_client(gemini_clients[idx], video_path)
             except QuotaExhaustedError as e:
                 retry_delays.append(e.retry_delay)
-                if idx + 1 < len(gemini_clients):
-                    logger.warning(
-                        f"Gemini key #{idx + 1} quota exhausted, switching to key #{idx + 2}"
-                    )
-                else:
-                    logger.warning(f"Gemini key #{idx + 1} quota exhausted, no keys left")
+                logger.warning(f"Gemini key #{idx + 1} quota exhausted, trying next key")
+            except KeyUnusableError as e:
+                disabled_gemini_keys.add(idx)
+                logger.error(
+                    f"Gemini key #{idx + 1} is denied/invalid, dropping it from rotation: {e}"
+                )
+
+        if not retry_delays:
+            # Every key we tried this round was just disabled; the check at the
+            # top of the loop decides whether anything is left
+            continue
 
         round_num += 1
         known_delays = [d for d in retry_delays if d]
