@@ -1,15 +1,16 @@
 """
-Discord Bot: 自動偵測頻道中的 Instagram Reels 連結，
-下載影片後丟給 Gemini API 做內容摘要，並回覆到頻道。
+Discord Bot: automatically detects Instagram Reels links in channels,
+downloads the video, sends it to the Gemini API for a content summary,
+and replies in the channel.
 
-需要環境變數 (.env)：
-    DISCORD_BOT_TOKEN=你的 discord bot token
-    GEMINI_API_KEY=你的 Gemini API key
+Required environment variables (.env):
+    DISCORD_BOT_TOKEN=your discord bot token
+    GEMINI_API_KEY=your Gemini API key
 
-安裝依賴：
+Install dependencies:
     pip install -U discord.py yt-dlp google-genai python-dotenv --break-system-packages
 
-執行：
+Run:
     python bot.py
 """
 
@@ -30,30 +31,31 @@ from google import genai
 from google.genai import types
 from google.genai import errors as genai_errors
 
-# ---------- 基本設定 ----------
+# ---------- Basic setup ----------
 
 load_dotenv()
 
 DISCORD_TOKEN = os.environ["DISCORD_BOT_TOKEN"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 
-# 也支援一般 instagram.com/p/ 貼文（有些 reel 會用 /p/ 格式），可自行增減
+# Also matches regular instagram.com/p/ posts (some reels use the /p/ format);
+# adjust as needed
 IG_URL_PATTERN = re.compile(
     r"(https?://(?:www\.)?instagram\.com/(?:reel|reels|p)/[A-Za-z0-9_\-]+/?[^\s]*)",
     re.IGNORECASE,
 )
 
-MAX_VIDEO_MB = 100  # 超過這個大小就跳過，避免佔用太多流量/額度
-GEMINI_MODEL = "gemini-flash-latest"  # 永遠指向最新的穩定版 Flash，想要更準確可換成 gemini-pro-latest
+MAX_VIDEO_MB = 100  # Skip videos larger than this to avoid burning bandwidth/quota
+GEMINI_MODEL = "gemini-flash-latest"  # Always points at the latest stable Flash; switch to gemini-pro-latest for higher accuracy
 
-# 免費層 RPM 很低，同一時間只讓一支影片跑 Gemini 請求，其他人排隊等
-# 避免多人同時貼連結時瞬間炸開額度
+# Free-tier RPM is very low: only let one video hit Gemini at a time and make
+# everyone else queue, so multiple links posted at once don't blow the quota
 GEMINI_CONCURRENCY = 1
 gemini_semaphore = asyncio.Semaphore(GEMINI_CONCURRENCY)
 
-# 重試設定（針對 429 額度超限 / 503 暫時性錯誤）
+# Retry settings (for 429 quota-exceeded / 503 transient errors)
 MAX_RETRIES = 4
-BASE_BACKOFF_SECONDS = 5  # 每次重試間隔會指數成長：5s, 10s, 20s, 40s...
+BASE_BACKOFF_SECONDS = 5  # Backoff grows exponentially: 5s, 10s, 20s, 40s...
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ig-reels-bot")
@@ -66,12 +68,12 @@ gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
 
 class QuotaExceededError(Exception):
-    """重試多次後仍然遇到 429/額度用盡，讓上層可以顯示友善訊息。"""
+    """Still hitting 429/quota exhaustion after all retries; lets the caller show a friendly message."""
     pass
 
 
 def _is_retryable_error(e: Exception) -> bool:
-    """判斷是否為暫時性錯誤（額度超限 429、伺服器忙碌 503 等），值得重試。"""
+    """Check whether an error is transient (429 quota exceeded, 503 server busy, etc.) and worth retrying."""
     msg = str(e)
     status_code = getattr(e, "code", None) or getattr(e, "status_code", None)
     if status_code in (429, 503):
@@ -80,7 +82,7 @@ def _is_retryable_error(e: Exception) -> bool:
 
 
 def _call_with_retry(func, *args, **kwargs):
-    """對 Gemini API 呼叫做指數退避重試，最後仍失敗就拋出 QuotaExceededError。"""
+    """Call the Gemini API with exponential backoff; raise QuotaExceededError if all retries fail."""
     last_error = None
     for attempt in range(MAX_RETRIES + 1):
         try:
@@ -91,17 +93,17 @@ def _call_with_retry(func, *args, **kwargs):
                 raise
             wait = BASE_BACKOFF_SECONDS * (2 ** attempt) + random.uniform(0, 2)
             logger.warning(
-                f"Gemini 請求遇到暫時性錯誤（第 {attempt + 1} 次），"
-                f"{wait:.1f} 秒後重試: {e}"
+                f"Gemini request hit a transient error (attempt {attempt + 1}), "
+                f"retrying in {wait:.1f}s: {e}"
             )
             time.sleep(wait)
     raise QuotaExceededError(str(last_error))
 
 
-# ---------- 核心功能 ----------
+# ---------- Core features ----------
 
 def download_reel(url: str, out_dir: str) -> Path | None:
-    """用 yt-dlp 下載 IG reel 影片，回傳檔案路徑。失敗回傳 None。"""
+    """Download an IG reel with yt-dlp and return the file path, or None on failure."""
     out_template = os.path.join(out_dir, "%(id)s.%(ext)s")
     ydl_opts = {
         "outtmpl": out_template,
@@ -109,7 +111,7 @@ def download_reel(url: str, out_dir: str) -> Path | None:
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
-        # 如果要抓需要登入的帳號內容，可以加上：
+        # To fetch content that requires login, add:
         # "cookiefile": "cookies.txt",
     }
     try:
@@ -118,7 +120,7 @@ def download_reel(url: str, out_dir: str) -> Path | None:
             filepath = ydl.prepare_filename(info)
             return Path(filepath)
     except Exception as e:
-        logger.error(f"yt-dlp 下載失敗: {e}")
+        logger.error(f"yt-dlp download failed: {e}")
         return None
 
 
@@ -127,12 +129,12 @@ def _upload_file(video_path: Path):
 
 
 def _wait_for_processing(uploaded_file):
-    """等待 Gemini 端處理完影片（轉檔/索引），通常幾秒到幾十秒。"""
+    """Wait for Gemini to finish processing the video (transcode/index), usually seconds to tens of seconds."""
     while uploaded_file.state.name == "PROCESSING":
         time.sleep(2)
         uploaded_file = gemini_client.files.get(name=uploaded_file.name)
     if uploaded_file.state.name == "FAILED":
-        raise RuntimeError("Gemini 影片處理失敗")
+        raise RuntimeError("Gemini video processing failed")
     return uploaded_file
 
 
@@ -153,16 +155,18 @@ def _generate_summary(uploaded_file):
 
 def summarize_video_with_gemini(video_path: Path) -> str:
     """
-    把影片上傳給 Gemini，請它看完影片後產生摘要（同步阻塞呼叫）。
-    上傳、等待處理、產生內容這三步都各自包了重試機制，
-    遇到 429（額度超限）或 503（伺服器忙碌）會自動退避重試；
-    重試用盡則拋出 QuotaExceededError，由呼叫端顯示友善訊息。
+    Upload the video to Gemini and ask it to produce a summary (synchronous, blocking).
+    Upload, processing wait, and generation each have their own retry wrapper:
+    429 (quota exceeded) and 503 (server busy) trigger automatic backoff retries;
+    once retries are exhausted, QuotaExceededError is raised for the caller
+    to show a friendly message.
     """
     uploaded_file = _call_with_retry(_upload_file, video_path)
     uploaded_file = _call_with_retry(_wait_for_processing, uploaded_file)
     response = _call_with_retry(_generate_summary, uploaded_file)
 
-    # 清理雲端檔案，避免占用配額（這步失敗不影響摘要結果，不重試）
+    # Clean up the cloud file to free quota (failure here doesn't affect the
+    # summary, so no retry)
     try:
         gemini_client.files.delete(name=uploaded_file.name)
     except Exception:
@@ -171,11 +175,11 @@ def summarize_video_with_gemini(video_path: Path) -> str:
     return response.text
 
 
-# ---------- Discord 事件 ----------
+# ---------- Discord events ----------
 
 @bot.event
 async def on_ready():
-    logger.info(f"已登入為 {bot.user}")
+    logger.info(f"Logged in as {bot.user}")
 
 
 @bot.event
@@ -198,7 +202,7 @@ async def handle_reel(message: discord.Message, url: str):
     status_msg = await message.reply(f"🔎 偵測到 Reels 連結，下載中...\n{url}")
 
     with tempfile.TemporaryDirectory() as tmp_dir:
-        # 下載影片（阻塞操作丟到 thread，避免卡住 event loop）
+        # Download the video (blocking work goes to a thread so the event loop stays free)
         video_path = await asyncio.to_thread(download_reel, url, tmp_dir)
 
         if video_path is None or not video_path.exists():
@@ -210,8 +214,8 @@ async def handle_reel(message: discord.Message, url: str):
             await status_msg.edit(content=f"⚠️ 影片大小 {size_mb:.1f}MB 超過上限，略過摘要。\n{url}")
             return
 
-        # 免費層 RPM 很低，用 semaphore 讓多支影片排隊送 Gemini，
-        # 避免多人同時貼連結時同時發request觸發 429
+        # Free-tier RPM is very low: the semaphore makes videos queue for Gemini
+        # so simultaneous links don't fire concurrent requests and trigger 429s
         if gemini_semaphore.locked():
             await status_msg.edit(content=f"⏳ 前面還有影片在分析，排隊等候中...\n{url}")
 
@@ -221,7 +225,7 @@ async def handle_reel(message: discord.Message, url: str):
             try:
                 summary = await asyncio.to_thread(summarize_video_with_gemini, video_path)
             except QuotaExceededError:
-                logger.warning(f"Gemini 額度已用盡: {url}")
+                logger.warning(f"Gemini quota exhausted: {url}")
                 await status_msg.edit(
                     content=(
                         f"⏸️ 目前 Gemini 免費額度已用盡（RPM/RPD 上限），"
@@ -230,11 +234,11 @@ async def handle_reel(message: discord.Message, url: str):
                 )
                 return
             except Exception as e:
-                logger.exception("Gemini 摘要失敗")
+                logger.exception("Gemini summarization failed")
                 await status_msg.edit(content=f"❌ AI 摘要失敗：{e}\n{url}")
                 return
 
-        # Discord 單則訊息上限 2000 字，超過就截斷
+        # Discord messages cap at 2000 characters; truncate if needed
         if len(summary) > 1900:
             summary = summary[:1900] + "\n...(內容過長，已截斷)"
 
