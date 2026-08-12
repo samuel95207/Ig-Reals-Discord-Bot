@@ -24,13 +24,13 @@ brew install ffmpeg
 docker compose up -d --build
 ```
 
-Set `DISCORD_BOT_TOKEN` and `GEMINI_API_KEY` in a `.env` file (see `.env.example`) or as environment variables before starting.
+Set `DISCORD_BOT_TOKEN` and `GEMINI_API_KEYS` in a `.env` file (see `.env.example`) or as environment variables before starting.
 
 ## Setup
 
 1. Copy `.env.example` to `.env` and fill in:
    - `DISCORD_BOT_TOKEN`: create a bot at the [Discord Developer Portal](https://discord.com/developers/applications)
-   - `GEMINI_API_KEY`: get one from [Google AI Studio](https://aistudio.google.com/apikey)
+   - `GEMINI_API_KEYS`: one or more keys from [Google AI Studio](https://aistudio.google.com/apikey), comma-separated. Keys are tried in order: when one's quota is exhausted the bot switches to the next, and only waits for a refill when all are exhausted. (`GEMINI_API_KEY` with a single key still works.)
 
 2. In the Discord Developer Portal, under your app's Bot settings, enable the **Message Content Intent** (required — without it the bot cannot read message content and will fail to start).
 

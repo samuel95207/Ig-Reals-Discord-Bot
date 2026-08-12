@@ -5,7 +5,7 @@ and replies in the channel.
 
 Required environment variables (.env):
     DISCORD_BOT_TOKEN=your discord bot token
-    GEMINI_API_KEY=your Gemini API key
+    GEMINI_API_KEYS=comma-separated Gemini API keys (or GEMINI_API_KEY for one)
 
 Install dependencies:
     pip install -U discord.py yt-dlp google-genai python-dotenv --break-system-packages
@@ -38,7 +38,17 @@ from google.genai import errors as genai_errors
 load_dotenv()
 
 DISCORD_TOKEN = os.environ["DISCORD_BOT_TOKEN"]
-GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
+# Comma-separated list of Gemini API keys, tried in order: when one key's
+# quota is exhausted the bot switches to the next, and only waits for a
+# refill once every key is exhausted. Falls back to the single-key
+# GEMINI_API_KEY for backward compatibility.
+GEMINI_API_KEYS = [
+    key.strip()
+    for key in os.environ.get("GEMINI_API_KEYS", os.environ.get("GEMINI_API_KEY", "")).split(",")
+    if key.strip()
+]
+if not GEMINI_API_KEYS:
+    raise RuntimeError("Set GEMINI_API_KEYS (comma-separated) or GEMINI_API_KEY")
 
 # Also matches regular instagram.com/p/ posts (some reels use the /p/ format);
 # adjust as needed
@@ -77,7 +87,9 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+# One client per key; uploads are tied to the key that made them, so a key
+# switch restarts the whole upload → analyze pipeline on the new client
+gemini_clients = [genai.Client(api_key=key) for key in GEMINI_API_KEYS]
 
 
 # The shortcode uniquely identifies a reel; tracking params like ?igsh=... vary
@@ -152,45 +164,29 @@ def _parse_retry_delay_seconds(e: Exception) -> float | None:
     return None
 
 
-async def _call_with_retry(func, *args, status_msg=None, url=""):
+class QuotaExhaustedError(Exception):
+    """One key's quota is exhausted; the caller switches keys or waits for a refill."""
+
+    def __init__(self, original: Exception):
+        super().__init__(str(original))
+        self.retry_delay = _parse_retry_delay_seconds(original)
+
+
+async def _call_with_retry(func, *args):
     """
     Run a blocking Gemini call in a thread, retrying automatically.
     503-style transient errors back off exponentially up to MAX_RETRIES.
-    429 quota exhaustion waits for the quota to refill — using Google's
-    suggested retry delay when it provides one — for as long as it takes,
-    keeping the Discord status message updated so users know why it's waiting.
+    429 quota exhaustion raises QuotaExhaustedError so the caller can
+    switch to a backup key (or wait for a refill when none are left).
     """
     transient_attempts = 0
-    quota_attempts = 0
     while True:
         try:
             return await asyncio.to_thread(func, *args)
         except Exception as e:
             if _is_quota_error(e):
-                quota_attempts += 1
-                wait = _parse_retry_delay_seconds(e) or min(60.0 * quota_attempts, 300.0)
-                wait += random.uniform(1, 3)
-                logger.warning(
-                    f"Gemini quota exhausted (attempt {quota_attempts}), "
-                    f"waiting {wait:.0f}s for it to refill: {e}"
-                )
-                if status_msg is not None:
-                    try:
-                        await status_msg.edit(
-                            content=(
-                                f"⏸️ Gemini quota is exhausted — waiting {int(wait)}s for it to "
-                                f"refill, then retrying automatically (attempt {quota_attempts})...\n{url}"
-                            )
-                        )
-                    except discord.HTTPException:
-                        pass
-                await asyncio.sleep(wait)
-                if status_msg is not None:
-                    try:
-                        await status_msg.edit(content=f"🤖 AI is analyzing (this may take a moment)...\n{url}")
-                    except discord.HTTPException:
-                        pass
-            elif _is_transient_error(e) and transient_attempts < MAX_RETRIES:
+                raise QuotaExhaustedError(e) from e
+            if _is_transient_error(e) and transient_attempts < MAX_RETRIES:
                 transient_attempts += 1
                 wait = BASE_BACKOFF_SECONDS * (2 ** (transient_attempts - 1)) + random.uniform(0, 2)
                 logger.warning(
@@ -226,21 +222,21 @@ def download_reel(url: str, out_dir: str) -> Path | None:
         return None
 
 
-def _upload_file(video_path: Path):
-    return gemini_client.files.upload(file=str(video_path))
+def _upload_file(client, video_path: Path):
+    return client.files.upload(file=str(video_path))
 
 
-def _wait_for_processing(uploaded_file):
+def _wait_for_processing(client, uploaded_file):
     """Wait for Gemini to finish processing the video (transcode/index), usually seconds to tens of seconds."""
     while uploaded_file.state.name == "PROCESSING":
         time.sleep(2)
-        uploaded_file = gemini_client.files.get(name=uploaded_file.name)
+        uploaded_file = client.files.get(name=uploaded_file.name)
     if uploaded_file.state.name == "FAILED":
         raise RuntimeError("Gemini video processing failed")
     return uploaded_file
 
 
-def _generate_summary(uploaded_file):
+def _generate_summary(client, uploaded_file):
     prompt = (
         "請完整看過這支短影片（包含畫面內容與聲音對話），"
         "用繁體中文寫一段簡短摘要，描述影片的主題與內容重點，"
@@ -255,25 +251,65 @@ def _generate_summary(uploaded_file):
     )
 
 
+async def _summarize_with_client(client, video_path: Path) -> str:
+    """Run the full upload → process → summarize pipeline on one client/key."""
+    uploaded_file = await _call_with_retry(_upload_file, client, video_path)
+    try:
+        uploaded_file = await _call_with_retry(_wait_for_processing, client, uploaded_file)
+        response = await _call_with_retry(_generate_summary, client, uploaded_file)
+    finally:
+        # Clean up the cloud file to free quota (failure here doesn't affect
+        # the summary, so no retry)
+        try:
+            await asyncio.to_thread(client.files.delete, name=uploaded_file.name)
+        except Exception:
+            pass
+    return response.text
+
+
 async def summarize_video_with_gemini(video_path: Path, status_msg, url: str) -> str:
     """
     Upload the video to Gemini and ask it to produce a summary.
-    Upload, processing wait, and generation each retry automatically:
-    503 (server busy) backs off exponentially, and 429 (quota exhausted)
-    waits for the quota to refill for as long as it takes.
+    Keys are tried in order: when one's quota is exhausted the next takes
+    over (restarting the pipeline, since uploads are key-scoped). Once every
+    key is exhausted, wait for the quota to refill — using Google's suggested
+    retry delay when available — and start over, for as long as it takes.
     """
-    uploaded_file = await _call_with_retry(_upload_file, video_path, status_msg=status_msg, url=url)
-    uploaded_file = await _call_with_retry(_wait_for_processing, uploaded_file, status_msg=status_msg, url=url)
-    response = await _call_with_retry(_generate_summary, uploaded_file, status_msg=status_msg, url=url)
+    round_num = 0
+    while True:
+        retry_delays = []
+        for idx, client in enumerate(gemini_clients):
+            try:
+                return await _summarize_with_client(client, video_path)
+            except QuotaExhaustedError as e:
+                retry_delays.append(e.retry_delay)
+                if idx + 1 < len(gemini_clients):
+                    logger.warning(
+                        f"Gemini key #{idx + 1} quota exhausted, switching to key #{idx + 2}"
+                    )
+                else:
+                    logger.warning(f"Gemini key #{idx + 1} quota exhausted, no keys left")
 
-    # Clean up the cloud file to free quota (failure here doesn't affect the
-    # summary, so no retry)
-    try:
-        await asyncio.to_thread(gemini_client.files.delete, name=uploaded_file.name)
-    except Exception:
-        pass
-
-    return response.text
+        round_num += 1
+        known_delays = [d for d in retry_delays if d]
+        wait = (min(known_delays) if known_delays else min(60.0 * round_num, 300.0)) + random.uniform(1, 3)
+        logger.warning(f"All Gemini keys exhausted (round {round_num}), waiting {wait:.0f}s for a refill")
+        if status_msg is not None:
+            try:
+                await status_msg.edit(
+                    content=(
+                        f"⏸️ All Gemini API keys are out of quota — waiting {int(wait)}s for a "
+                        f"refill, then retrying automatically (attempt {round_num})...\n{url}"
+                    )
+                )
+            except discord.HTTPException:
+                pass
+        await asyncio.sleep(wait)
+        if status_msg is not None:
+            try:
+                await status_msg.edit(content=f"🤖 AI is analyzing (this may take a moment)...\n{url}")
+            except discord.HTTPException:
+                pass
 
 
 # ---------- Discord events ----------

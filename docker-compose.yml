@@ -9,6 +9,9 @@ services:
     restart: unless-stopped
     environment:
       - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN}
+      # Comma-separated list of keys, tried in order when quota runs out;
+      # GEMINI_API_KEY still works as a single-key fallback
+      - GEMINI_API_KEYS=${GEMINI_API_KEYS}
       - GEMINI_API_KEY=${GEMINI_API_KEY}
     volumes:
       - ig_cookies:/app/cookies
