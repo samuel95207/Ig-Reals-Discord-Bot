@@ -35,7 +35,7 @@ brew install ffmpeg
 ## 執行
 
 ```bash
-python bot.py
+python src/bot.py
 ```
 
 ## 運作流程
