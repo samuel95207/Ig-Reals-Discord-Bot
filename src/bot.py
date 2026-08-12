@@ -44,7 +44,7 @@ IG_URL_PATTERN = re.compile(
 )
 
 MAX_VIDEO_MB = 100  # 超過這個大小就跳過，避免佔用太多流量/額度
-GEMINI_MODEL = "gemini-2.5-flash"  # 想要更準確可換成 gemini-2.5-pro
+GEMINI_MODEL = "gemini-flash-latest"  # 永遠指向最新的穩定版 Flash，想要更準確可換成 gemini-pro-latest
 
 # 免費層 RPM 很低，同一時間只讓一支影片跑 Gemini 請求，其他人排隊等
 # 避免多人同時貼連結時瞬間炸開額度
