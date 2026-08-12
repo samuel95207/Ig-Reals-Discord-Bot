@@ -46,6 +46,11 @@ IG_URL_PATTERN = re.compile(
 )
 
 MAX_VIDEO_MB = 100  # Skip videos larger than this to avoid burning bandwidth/quota
+
+# Optional Instagram session cookies (Netscape cookies.txt format). When the
+# file exists, yt-dlp uses the logged-in session, which allows downloading
+# age/audience-restricted reels. See README for how to export it.
+IG_COOKIE_FILE = os.environ.get("IG_COOKIE_FILE", "/app/cookies/cookies.txt")
 GEMINI_MODEL = "gemini-flash-latest"  # Always points at the latest stable Flash; switch to gemini-pro-latest for higher accuracy
 
 # Free-tier RPM is very low: only let one video hit Gemini at a time and make
@@ -111,9 +116,9 @@ def download_reel(url: str, out_dir: str) -> Path | None:
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
-        # To fetch content that requires login, add:
-        # "cookiefile": "cookies.txt",
     }
+    if os.path.exists(IG_COOKIE_FILE):
+        ydl_opts["cookiefile"] = IG_COOKIE_FILE
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)

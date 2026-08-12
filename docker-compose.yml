@@ -7,3 +7,8 @@ services:
     environment:
       - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN}
       - GEMINI_API_KEY=${GEMINI_API_KEY}
+    volumes:
+      - ig_cookies:/app/cookies
+
+volumes:
+  ig_cookies:
