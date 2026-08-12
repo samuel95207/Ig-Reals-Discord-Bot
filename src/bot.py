@@ -245,7 +245,7 @@ def _generate_summary(client, uploaded_file):
         "請以自然的短文呈現，不要使用條列式，用兩三句話即可，"
         "整體輸出總長度嚴格控制在大約 100 字以內。"
     )
-    return gemini_client.models.generate_content(
+    return client.models.generate_content(
         model=GEMINI_MODEL,
         contents=[uploaded_file, prompt],
     )
