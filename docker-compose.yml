@@ -1,0 +1,9 @@
+services:
+  ig-reels-bot:
+    build: .
+    image: ig-reels-discord-bot:latest
+    container_name: ig-reels-discord-bot
+    restart: unless-stopped
+    environment:
+      - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
