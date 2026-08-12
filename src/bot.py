@@ -195,10 +195,10 @@ def _generate_summary(uploaded_file):
     prompt = (
         "請完整看過這支短影片（包含畫面內容與聲音對話），"
         "用繁體中文寫一份簡短摘要，包含：\n"
-        "1. 影片主題／內容重點（2-4 句話）\n"
+        "1. 影片主題／內容重點\n"
         "2. 如果有講話或字幕，摘要重點訊息\n"
         "3. 影片的整體語氣或風格（例如：教學、搞笑、開箱、劇情等）\n"
-        "請用條列式呈現，不要太長。"
+        "請用條列式呈現，整體輸出總長度嚴格控制在大約 100 字以內。"
     )
     return gemini_client.models.generate_content(
         model=GEMINI_MODEL,
