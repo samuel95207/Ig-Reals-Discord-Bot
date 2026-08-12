@@ -2,6 +2,9 @@ services:
   ig-reels-bot:
     build: .
     image: ig-reels-discord-bot:latest
+    # The image is built from source, not pulled from a registry; without this,
+    # Portainer's auto-update redeploy fails trying to pull it
+    pull_policy: build
     container_name: ig-reels-discord-bot
     restart: unless-stopped
     environment:
