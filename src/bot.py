@@ -64,7 +64,9 @@ GEMINI_MODEL = "gemini-flash-latest"  # Always points at the latest stable Flash
 GEMINI_CONCURRENCY = 1
 gemini_semaphore = asyncio.Semaphore(GEMINI_CONCURRENCY)
 
-# Retry settings (for 429 quota-exceeded / 503 transient errors)
+# Retry settings for 503-style transient errors. 429 quota exhaustion is not
+# capped: the bot waits for the quota to refill (using Google's suggested
+# retry delay) and retries until it succeeds.
 MAX_RETRIES = 4
 BASE_BACKOFF_SECONDS = 5  # Backoff grows exponentially: 5s, 10s, 20s, 40s...
 
@@ -120,37 +122,84 @@ seen_reels: dict = _load_seen_reels()
 in_progress_reels: set[str] = set()
 
 
-class QuotaExceededError(Exception):
-    """Still hitting 429/quota exhaustion after all retries; lets the caller show a friendly message."""
-    pass
-
-
-def _is_retryable_error(e: Exception) -> bool:
-    """Check whether an error is transient (429 quota exceeded, 503 server busy, etc.) and worth retrying."""
-    msg = str(e)
+def _is_quota_error(e: Exception) -> bool:
+    """429 / RESOURCE_EXHAUSTED: out of quota, will succeed again once it refills."""
     status_code = getattr(e, "code", None) or getattr(e, "status_code", None)
-    if status_code in (429, 503):
+    if status_code == 429:
         return True
-    return any(kw in msg for kw in ("429", "RESOURCE_EXHAUSTED", "503", "UNAVAILABLE"))
+    msg = str(e)
+    return "429" in msg or "RESOURCE_EXHAUSTED" in msg
 
 
-def _call_with_retry(func, *args, **kwargs):
-    """Call the Gemini API with exponential backoff; raise QuotaExceededError if all retries fail."""
-    last_error = None
-    for attempt in range(MAX_RETRIES + 1):
+def _is_transient_error(e: Exception) -> bool:
+    """503 / UNAVAILABLE: server busy, worth a few quick retries."""
+    status_code = getattr(e, "code", None) or getattr(e, "status_code", None)
+    if status_code == 503:
+        return True
+    msg = str(e)
+    return "503" in msg or "UNAVAILABLE" in msg
+
+
+def _parse_retry_delay_seconds(e: Exception) -> float | None:
+    """Extract Google's suggested retry delay from a 429 error, if present."""
+    msg = str(e)
+    match = re.search(r"[Rr]etry in ([0-9.]+)s", msg)
+    if match:
+        return float(match.group(1))
+    match = re.search(r"retryDelay['\"]?\s*[:=]\s*['\"]?([0-9.]+)s", msg)
+    if match:
+        return float(match.group(1))
+    return None
+
+
+async def _call_with_retry(func, *args, status_msg=None, url=""):
+    """
+    Run a blocking Gemini call in a thread, retrying automatically.
+    503-style transient errors back off exponentially up to MAX_RETRIES.
+    429 quota exhaustion waits for the quota to refill — using Google's
+    suggested retry delay when it provides one — for as long as it takes,
+    keeping the Discord status message updated so users know why it's waiting.
+    """
+    transient_attempts = 0
+    quota_attempts = 0
+    while True:
         try:
-            return func(*args, **kwargs)
+            return await asyncio.to_thread(func, *args)
         except Exception as e:
-            last_error = e
-            if not _is_retryable_error(e) or attempt == MAX_RETRIES:
+            if _is_quota_error(e):
+                quota_attempts += 1
+                wait = _parse_retry_delay_seconds(e) or min(60.0 * quota_attempts, 300.0)
+                wait += random.uniform(1, 3)
+                logger.warning(
+                    f"Gemini quota exhausted (attempt {quota_attempts}), "
+                    f"waiting {wait:.0f}s for it to refill: {e}"
+                )
+                if status_msg is not None:
+                    try:
+                        await status_msg.edit(
+                            content=(
+                                f"⏸️ Gemini quota is exhausted — waiting {int(wait)}s for it to "
+                                f"refill, then retrying automatically (attempt {quota_attempts})...\n{url}"
+                            )
+                        )
+                    except discord.HTTPException:
+                        pass
+                await asyncio.sleep(wait)
+                if status_msg is not None:
+                    try:
+                        await status_msg.edit(content=f"🤖 AI is analyzing (this may take a moment)...\n{url}")
+                    except discord.HTTPException:
+                        pass
+            elif _is_transient_error(e) and transient_attempts < MAX_RETRIES:
+                transient_attempts += 1
+                wait = BASE_BACKOFF_SECONDS * (2 ** (transient_attempts - 1)) + random.uniform(0, 2)
+                logger.warning(
+                    f"Gemini request hit a transient error (attempt {transient_attempts}), "
+                    f"retrying in {wait:.1f}s: {e}"
+                )
+                await asyncio.sleep(wait)
+            else:
                 raise
-            wait = BASE_BACKOFF_SECONDS * (2 ** attempt) + random.uniform(0, 2)
-            logger.warning(
-                f"Gemini request hit a transient error (attempt {attempt + 1}), "
-                f"retrying in {wait:.1f}s: {e}"
-            )
-            time.sleep(wait)
-    raise QuotaExceededError(str(last_error))
 
 
 # ---------- Core features ----------
@@ -206,22 +255,21 @@ def _generate_summary(uploaded_file):
     )
 
 
-def summarize_video_with_gemini(video_path: Path) -> str:
+async def summarize_video_with_gemini(video_path: Path, status_msg, url: str) -> str:
     """
-    Upload the video to Gemini and ask it to produce a summary (synchronous, blocking).
-    Upload, processing wait, and generation each have their own retry wrapper:
-    429 (quota exceeded) and 503 (server busy) trigger automatic backoff retries;
-    once retries are exhausted, QuotaExceededError is raised for the caller
-    to show a friendly message.
+    Upload the video to Gemini and ask it to produce a summary.
+    Upload, processing wait, and generation each retry automatically:
+    503 (server busy) backs off exponentially, and 429 (quota exhausted)
+    waits for the quota to refill for as long as it takes.
     """
-    uploaded_file = _call_with_retry(_upload_file, video_path)
-    uploaded_file = _call_with_retry(_wait_for_processing, uploaded_file)
-    response = _call_with_retry(_generate_summary, uploaded_file)
+    uploaded_file = await _call_with_retry(_upload_file, video_path, status_msg=status_msg, url=url)
+    uploaded_file = await _call_with_retry(_wait_for_processing, uploaded_file, status_msg=status_msg, url=url)
+    response = await _call_with_retry(_generate_summary, uploaded_file, status_msg=status_msg, url=url)
 
     # Clean up the cloud file to free quota (failure here doesn't affect the
     # summary, so no retry)
     try:
-        gemini_client.files.delete(name=uploaded_file.name)
+        await asyncio.to_thread(gemini_client.files.delete, name=uploaded_file.name)
     except Exception:
         pass
 
@@ -315,7 +363,9 @@ async def _analyze_reel(message: discord.Message, url: str, key: str):
             return
 
         # Free-tier RPM is very low: the semaphore makes videos queue for Gemini
-        # so simultaneous links don't fire concurrent requests and trigger 429s
+        # so simultaneous links don't fire concurrent requests and trigger 429s.
+        # A quota wait deliberately holds the semaphore — nothing behind it
+        # could succeed without quota either.
         if gemini_semaphore.locked():
             await status_msg.edit(content=f"⏳ Another video is still being analyzed, waiting in queue...\n{url}")
 
@@ -323,16 +373,7 @@ async def _analyze_reel(message: discord.Message, url: str, key: str):
             await status_msg.edit(content=f"🤖 AI is analyzing (this may take a moment)...\n{url}")
 
             try:
-                summary = await asyncio.to_thread(summarize_video_with_gemini, video_path)
-            except QuotaExceededError:
-                logger.warning(f"Gemini quota exhausted: {url}")
-                await status_msg.edit(
-                    content=(
-                        f"⏸️ Gemini free-tier quota is exhausted (RPM/RPD limit). "
-                        f"Please try again in a few minutes, or repost the link later.\n{url}"
-                    )
-                )
-                return
+                summary = await summarize_video_with_gemini(video_path, status_msg, url)
             except Exception as e:
                 logger.exception("Gemini summarization failed")
                 await status_msg.edit(content=f"❌ AI summary failed: {e}\n{url}")
