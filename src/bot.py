@@ -140,12 +140,12 @@ def _wait_for_processing(uploaded_file):
 
 def _generate_summary(uploaded_file):
     prompt = (
-        "Watch this entire short video (both the visuals and the audio/dialogue) "
-        "and write a brief summary in English, including:\n"
-        "1. The video's topic / main points (2-4 sentences)\n"
-        "2. If there is speech or subtitles, summarize the key messages\n"
-        "3. The overall tone or style of the video (e.g. tutorial, comedy, unboxing, skit)\n"
-        "Present it as a bullet list; keep it short."
+        "請完整看過這支短影片（包含畫面內容與聲音對話），"
+        "用繁體中文寫一份簡短摘要，包含：\n"
+        "1. 影片主題／內容重點（2-4 句話）\n"
+        "2. 如果有講話或字幕，摘要重點訊息\n"
+        "3. 影片的整體語氣或風格（例如：教學、搞笑、開箱、劇情等）\n"
+        "請用條列式呈現，不要太長。"
     )
     return gemini_client.models.generate_content(
         model=GEMINI_MODEL,
