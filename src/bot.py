@@ -50,10 +50,10 @@ GEMINI_API_KEYS = [
 if not GEMINI_API_KEYS:
     raise RuntimeError("Set GEMINI_API_KEYS (comma-separated) or GEMINI_API_KEY")
 
-# Also matches regular instagram.com/p/ posts (some reels use the /p/ format);
-# adjust as needed
+# Reels links only: /p/ posts are often photos with no video, so the bot
+# ignores them entirely (no download attempt, no reply)
 IG_URL_PATTERN = re.compile(
-    r"(https?://(?:www\.)?instagram\.com/(?:reel|reels|p)/[A-Za-z0-9_\-]+/?[^\s]*)",
+    r"(https?://(?:www\.)?instagram\.com/(?:reel|reels)/[A-Za-z0-9_\-]+/?[^\s]*)",
     re.IGNORECASE,
 )
 
@@ -99,7 +99,7 @@ disabled_gemini_keys: set[int] = set()
 # The shortcode uniquely identifies a reel; tracking params like ?igsh=... vary
 # per sender, so dedupe on the shortcode rather than the full URL
 SHORTCODE_PATTERN = re.compile(
-    r"instagram\.com/(?:reel|reels|p)/([A-Za-z0-9_\-]+)", re.IGNORECASE
+    r"instagram\.com/(?:reel|reels)/([A-Za-z0-9_\-]+)", re.IGNORECASE
 )
 
 
