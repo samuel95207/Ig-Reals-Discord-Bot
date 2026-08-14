@@ -219,25 +219,42 @@ async def _call_with_retry(func, *args):
 
 # ---------- Core features ----------
 
-def download_reel(url: str, out_dir: str) -> Path | None:
-    """Download an IG reel with yt-dlp and return the file path, or None on failure."""
-    out_template = os.path.join(out_dir, "%(id)s.%(ext)s")
+def _ydl_download(url: str, out_dir: str, use_cookies: bool) -> Path:
     ydl_opts = {
-        "outtmpl": out_template,
+        "outtmpl": os.path.join(out_dir, "%(id)s.%(ext)s"),
         "format": "mp4/best",
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
     }
-    if os.path.exists(IG_COOKIE_FILE):
+    if use_cookies:
         ydl_opts["cookiefile"] = IG_COOKIE_FILE
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        return Path(ydl.prepare_filename(info))
+
+
+def download_reel(url: str, out_dir: str) -> Path | None:
+    """
+    Download an IG reel with yt-dlp and return the file path, or None on failure.
+    Tries an anonymous session first so the logged-in account isn't burned on
+    public reels; only when that fails (age/audience-restricted, login-walled)
+    does it retry with the session cookies.
+    """
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            filepath = ydl.prepare_filename(info)
-            return Path(filepath)
+        return _ydl_download(url, out_dir, use_cookies=False)
     except Exception as e:
-        logger.error(f"yt-dlp download failed: {e}")
+        anon_error = e
+
+    if not os.path.exists(IG_COOKIE_FILE):
+        logger.error(f"yt-dlp anonymous download failed (no cookie file to fall back on): {anon_error}")
+        return None
+
+    logger.info(f"Anonymous download failed, retrying with logged-in session: {anon_error}")
+    try:
+        return _ydl_download(url, out_dir, use_cookies=True)
+    except Exception as e:
+        logger.error(f"yt-dlp download failed with logged-in session too: {e}")
         return None
 
 
